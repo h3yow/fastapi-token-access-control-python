@@ -3,7 +3,8 @@
 令牌格式（类 JWT，自包含、无外部依赖）：
     base64url(header) "." base64url(payload) "." base64url(signature)
 - header:  {"alg": "HS256", "kid": <密钥标识>}
-- payload: {"sub", "scopes", "exp", "iat", "jti", "kid"}
+- payload: {"sub", "scopes", "exp", "iat", "jti", "kid", "gen"?}
+  （gen 为可选的主体凭证世代，用于按用户批量吊销；旧令牌缺省按 0 处理）
 - signature: HMAC-SHA256(signing_input, secret)
 
 校验完全由输入（令牌串、密钥集合、当前时刻）决定，
@@ -43,6 +44,7 @@ class Claims:
     iat: int = 0
     jti: str = ""
     kid: str = ""
+    gen: int = 0  # 主体凭证世代：用于按用户批量吊销（旧令牌缺省为 0）
 
 
 @dataclass(frozen=True)
@@ -85,8 +87,13 @@ def issue_token(
     now: int | None = None,
     ttl: int = 3600,
     jti: str | None = None,
+    gen: int = 0,
 ) -> str:
-    """签发令牌。显式传入 now 以保证可复现；缺省取当前时间。"""
+    """签发令牌。显式传入 now 以保证可复现；缺省取当前时间。
+
+    gen 为主体凭证世代，用于按用户批量吊销：同一次登录周期内签发的
+    凭证携带相同世代，主体被整体吊销时世代推进，旧世代凭证立即失效。
+    """
     if now is None:
         now = int(time.time())
     payload = {
@@ -96,6 +103,7 @@ def issue_token(
         "iat": now,
         "jti": jti or uuid.uuid4().hex,
         "kid": key.kid,
+        "gen": gen,
     }
     header = {"alg": "HS256", "kid": key.kid}
     signing_input = (
@@ -145,6 +153,13 @@ def verify_token(
         isinstance(s, str) for s in payload["scopes"]
     ):
         return VerifyResult(False, error=TokenErrorKind.INCOMPLETE, detail="scopes 必须为字符串数组")
+    # gen 为可选声明（旧令牌不带），存在时必须为非负整数；缺失按世代 0 处理
+    if "gen" in payload and (
+        not isinstance(payload["gen"], int)
+        or isinstance(payload["gen"], bool)
+        or payload["gen"] < 0
+    ):
+        return VerifyResult(False, error=TokenErrorKind.INCOMPLETE, detail="gen 必须为非负整数")
 
     kid = payload["kid"]
     key = next((k for k in keys if k.kid == kid), None)
@@ -174,5 +189,6 @@ def verify_token(
         iat=int(payload["iat"]),
         jti=str(payload["jti"]),
         kid=kid,
+        gen=int(payload.get("gen", 0)),
     )
     return VerifyResult(True, claims=claims)

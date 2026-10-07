@@ -20,7 +20,6 @@ from app.keys import KeyStore, SigningKey
 from app.quota import QuotaLimiter
 from app.revocation import RevocationRegistry
 from app.service import AuthService, Decision
-from app.tokens import issue_token
 
 _STATUS_BY_DECISION = {
     Decision.DENY_UNAUTHENTICATED: 401,
@@ -41,6 +40,10 @@ class WriteRequest(BaseModel):
 
 class RevokeRequest(BaseModel):
     jti: str
+
+
+class SubjectRevokeRequest(BaseModel):
+    sub: str
 
 
 def create_app(
@@ -71,10 +74,30 @@ def create_app(
 
     @app.post("/tokens", status_code=201)
     def create_token(req: TokenRequest):
-        key = key_store.current()
         now = int(time.time())
-        token = issue_token(sub=req.sub, scopes=req.scopes, key=key, now=now, ttl=req.ttl)
-        return {"token": token, "kid": key.kid, "expires_at": now + req.ttl}
+        token, expires_at = service.issue(
+            sub=req.sub, scopes=req.scopes, ttl=req.ttl, now=now
+        )
+        return {"token": token, "kid": key_store.current().kid, "expires_at": expires_at}
+
+    @app.post("/tokens/renew")
+    def renew_token(response: Response, authorization: str | None = Header(None)):
+        token = _bearer_token(authorization)
+        result = service.renew(token)
+        if result.decision is not Decision.ALLOW:
+            response.status_code = _STATUS_BY_DECISION[result.decision]
+            return {"error": result.decision.value, "reason": result.reason}
+        assert result.token is not None and result.claims is not None
+        return {
+            "token": result.token,
+            "kid": result.claims.kid,
+            "expires_at": result.expires_at,
+        }
+
+    @app.post("/admin/revoke-subject")
+    def revoke_subject(req: SubjectRevokeRequest):
+        generation = service.revoke_subject(req.sub)
+        return {"revoked_subject": req.sub, "generation": generation}
 
     @app.get("/resources/{name}")
     def read_resource(name: str, response: Response, authorization: str | None = Header(None)):

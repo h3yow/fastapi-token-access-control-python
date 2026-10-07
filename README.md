@@ -1,7 +1,8 @@
 # FastAPI 令牌鉴权与细粒度访问控制
 
 在既有 FastAPI 服务上补齐令牌鉴权、按权限范围的读写控制、凭证吊销、
-密钥轮换与并发安全配额。所有判定对相同输入可复现，与请求处理顺序无关。
+密钥轮换与并发安全配额，并补全凭证生命周期：**在线续期**与**按用户
+批量吊销**。所有判定对相同输入可复现，与请求处理顺序无关。
 
 ## 鉴权模型
 
@@ -12,7 +13,9 @@ base64url(header) "." base64url(payload) "." base64url(signature)
 ```
 
 - `header`: `{"alg": "HS256", "kid": <密钥标识>}`
-- `payload`: `{"sub", "scopes", "exp", "iat", "jti", "kid"}`
+- `payload`: `{"sub", "scopes", "exp", "iat", "jti", "kid", "gen"?}`
+  （`gen` 为可选的主体凭证世代，用于按用户批量吊销，见下；历史令牌
+  不带该声明，校验时按世代 0 处理，向后兼容）
 - `signature`: `HMAC-SHA256(signing_input, secret)`
 
 校验按固定顺序执行，失败原因可区分（`TokenErrorKind`）：
@@ -24,7 +27,7 @@ base64url(header) "." base64url(payload) "." base64url(signature)
 | `unknown_key` | 签名密钥不在当前可接受集合内 |
 | `tampered` | 签名校验失败（内容被篡改或密钥不符） |
 | `expired` | 当前时刻不早于 `exp` |
-| `revoked` | jti 已被吊销（在服务层判定） |
+| `revoked` | jti 已被吊销（含已用于续期），或主体凭证世代已过期（按用户批量吊销），在服务层判定 |
 
 校验是纯函数：结果只取决于（令牌串、可接受密钥集合、当前时刻），
 不依赖请求处理顺序，相同输入判定可复现。
@@ -57,6 +60,60 @@ base64url(header) "." base64url(payload) "." base64url(signature)
   可接受集合，对应令牌以 `unknown_key` 拒绝。`acceptable_keys(now)` 为纯
   查询，相同 `now` 多次调用结果一致。
 
+## 凭证生命周期
+
+### 在线续期（`POST /tokens/renew`）
+
+持有一张**未过期、未吊销、世代未过期**的凭证，可直接换取新凭证，无需
+重新登录。请求以 `Authorization: Bearer <旧凭证>` 携带旧凭证。判定顺序
+固定为：**身份 → 配额 → 一次性消费旧 jti → 签发新凭证**。
+
+- **身份与权限不放大**：新凭证的 `sub`、`scopes` 与旧凭证完全一致，
+  TTL 沿用旧凭证的 `exp - iat`，但有效期自续期时刻重新计算（旧凭证
+  临近过期时，换出的新凭证重新获得完整生命周期）。只读凭证续期后
+  仍然只读，借续期拿不到写权限。
+- **旧凭证立即失效**：续期成功的同一把锁内把旧 jti 原子加入吊销集合
+  （`revoke_once`，仅首次返回成功）。之后再拿旧凭证访问或续期，一律
+  以 `revoked`（401）拒绝。
+- **并发只有一个成功**：同一张旧凭证同时发来多个续期请求，只有一个
+  请求能完成 jti 消费，其余全部以 `revoked` 拒绝，不会复制出多张都
+  有效的新凭证。
+- **失败归类与普通访问一致**：匿名、结构错误、声明不完整、过期、
+  篡改、未知密钥、已吊销/已续期 → 401；超配额 → 429。异常输入绝不
+  变成服务端故障，也绝不被放行；相同输入多次执行结论一致。
+- **配额照常计数**：续期请求与资源访问共用按主体的配额计数，不是
+  绕过限流的后门。配额判定先于 jti 消费，因此配额耗尽时旧凭证不被
+  消耗，下一个窗口仍可用原凭证重试。
+- 新凭证用**当前签名密钥**签发（携带新 `jti` 与主体当前世代）。
+- 与既有语义对齐：续期不要求额外范围；未通过身份的请求不消耗配额。
+
+### 按用户批量吊销（`POST /admin/revoke-subject`）
+
+运维场景下一次性停掉某主体手上当前所有有效凭证。机制为**凭证世代
+（generation）**：
+
+- 每个主体维护一个单调递增世代号（初始 0），令牌签发时把当时世代写入
+  `gen`；身份校验时比较令牌世代与主体当前世代，不一致即以 `revoked`
+  拒绝；
+- 吊销主体即原子把世代 +1，于是该主体**此前**签发的所有凭证立即失效，
+  无需枚举令牌；**之后**重新签发的凭证携带新世代，不受影响；
+- 只影响目标主体：世代按主体分别存储，其他主体的凭证完全不受波及；
+- **幂等且并发安全**：重复执行或并发执行只是连续/竞争推进世代，
+  世代号无重复无空洞，结论确定，不报错、不误伤；
+- 与单个 jti 吊销（`/admin/revoke`）正交：两种机制都落到身份阶段，
+  对外统一以 401 + `revoked` 可区分原因表达。
+
+### 与密钥轮换、配额、权限校验的兼容关系
+
+- **密钥轮换**：宽限期内旧密钥签发的凭证可以正常续期，换出的新凭证
+  一律由当前密钥签发；宽限期外旧密钥凭证以 `unknown_key` 拒绝续期，
+  不会被放行（`test_renew_works_across_key_rotation_within_grace`）。
+- **配额**：续期计入按主体配额；批量吊销是管理动作，不触碰配额状态；
+  被整体吊销的主体在身份阶段即被拒，其请求不消耗配额（与既有
+  “未通过身份不计数”规则一致）。
+- **权限范围**：续期不改变范围；新凭证的读写判定走既有
+  身份 → 权限 → 配额流水线，通配范围语义不变。
+
 ## 配额策略
 
 按主体（`sub`）的固定窗口计数（`QuotaLimiter`）：
@@ -72,13 +129,17 @@ base64url(header) "." base64url(payload) "." base64url(signature)
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 公开探活（既有行为不变） |
-| POST | `/tokens` | 签发令牌 `{sub, scopes, ttl}` |
+| POST | `/tokens` | 签发令牌 `{sub, scopes, ttl}`（携带主体当前世代） |
+| POST | `/tokens/renew` | 在线续期：以 `Authorization: Bearer <旧凭证>` 换新凭证 |
 | GET | `/resources/{name}` | 读资源（需 `<name>:read`） |
 | PUT | `/resources/{name}` | 写资源（需 `<name>:write`） |
 | POST | `/admin/revoke` | 按 jti 吊销 |
+| POST | `/admin/revoke-subject` | 按用户批量吊销 `{sub}`，返回推进后的世代号 |
 | POST | `/admin/keys/rotate` | 轮换签名密钥 |
 
-身份通过 `Authorization: Bearer <token>` 头携带。
+身份通过 `Authorization: Bearer <token>` 头携带。续期成功返回与签发
+相同形态的 `{token, kid, expires_at}`；失败返回 `{error, reason}`，
+状态码与普通访问一致（401/403/429）。
 
 ## 验证方法
 
@@ -89,4 +150,25 @@ uv run python -m pytest tests/ -q -s
 `-s` 下每个用例会打印输入与判定依据（`[case=...] inputs=... -> decision=..., reason=...`）。
 覆盖：正常签发校验、过期、篡改、声明不完整、未知密钥、匿名/越权区分、
 越权写不改状态、吊销、轮换窗口（期内/期外）、并发配额（500 并发请求
-对 50 上限）、配额窗口滚动、主体隔离，以及既有公开行为（`GET /`）回归。
+对 50 上限）、配额窗口滚动、主体隔离，以及既有公开行为（`GET /`）回归；
+生命周期用例（`tests/test_lifecycle.py`）另覆盖：续期成功后旧凭证失效、
+新凭证身份/范围/TTL 一致且不放大权限、64 并发续期仅一个成功、续期失败
+各归各类（匿名/畸形/过期/篡改/吊销/不完整/超配额）、续期计配额且配额
+拒绝不消耗旧凭证、按用户批量吊销（重复与 100 并发）、批量吊销不影响
+其他主体与之后新签发的凭证、续期跨密钥轮换宽限期。
+
+### 本地手工验证
+
+```bash
+uv run uvicorn main:app --reload
+# 1) 签发
+curl -s -X POST localhost:8000/tokens -H 'Content-Type: application/json' \
+  -d '{"sub":"alice","scopes":["doc:read"],"ttl":60}'
+# 2) 续期（用上一步返回的 token）
+curl -s -X POST localhost:8000/tokens/renew -H "Authorization: Bearer <token>"
+# 3) 再拿旧 token 访问 -> 401 revoked
+curl -s localhost:8000/resources/doc -H "Authorization: Bearer <old_token>"
+# 4) 按用户批量吊销
+curl -s -X POST localhost:8000/admin/revoke-subject \
+  -H 'Content-Type: application/json' -d '{"sub":"alice"}'
+```
