@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import enum
 import time
+import uuid
 from dataclasses import dataclass
 
 from .keys import KeyStore
 from .quota import QuotaLimiter
 from .revocation import RevocationRegistry
 from .scopes import has_scope, read_scope, write_scope
-from .tokens import Claims, TokenErrorKind, verify_token
+from .tokens import Claims, TokenErrorKind, issue_token, verify_token
 
 
 class Decision(enum.Enum):
@@ -31,6 +32,16 @@ class Decision(enum.Enum):
 class AccessResult:
     decision: Decision
     reason: str
+    claims: Claims | None = None
+
+
+@dataclass(frozen=True)
+class RenewalResult:
+    """续期结论：ALLOW 时携带新令牌串与新声明，否则携带可区分原因。"""
+
+    decision: Decision
+    reason: str
+    token: str | None = None
     claims: Claims | None = None
 
 
@@ -60,10 +71,11 @@ class AuthService:
                 f"凭证无效[{result.error.value}]: {result.detail}",
             )
         assert result.claims is not None
-        if self._revocation.is_revoked(result.claims.jti):
+        invalid = self._revocation.invalid_reason(result.claims.jti)
+        if invalid is not None:
             return AccessResult(
                 Decision.DENY_UNAUTHENTICATED,
-                f"凭证无效[{TokenErrorKind.REVOKED.value}]: 令牌已被吊销",
+                f"凭证无效[{TokenErrorKind.REVOKED.value}]: {invalid}",
             )
         return AccessResult(Decision.ALLOW, "身份校验通过", claims=result.claims)
 
@@ -105,3 +117,68 @@ class AuthService:
                 claims=auth.claims,
             )
         return AccessResult(Decision.ALLOW, "允许访问", claims=auth.claims)
+
+    def renew(
+        self,
+        token: str | None,
+        *,
+        ttl: int | None = None,
+        now: int | None = None,
+    ) -> RenewalResult:
+        """在线续期：旧凭证换发身份与范围完全一致的新凭证。
+
+        判定顺序固定，与访问鉴权保持一致：
+        1. 身份：旧凭证必须有效（匿名/不完整/篡改/过期/已吊销/已续期一律拒绝）；
+        2. 配额：续期请求照常按主体计数（不构成绕过限流的后门），超限 429；
+        3. 原子消费：同一旧凭证的并发续期恰好一个成功（consume 在锁内判定+标记），
+           落败者按 revoked 拒绝；成功时旧凭证立即失效，新凭证的 sub/scopes
+           逐字沿用旧凭证（权限不放大），有效期自 now 起重新计算。
+        """
+        if now is None:
+            now = int(time.time())
+
+        auth = self.authenticate(token, now=now)
+        if auth.decision is not Decision.ALLOW:
+            return RenewalResult(auth.decision, auth.reason)
+        old = auth.claims
+        assert old is not None
+
+        # 有效期长度沿用原凭证：新 exp - now == 旧 exp - 旧 iat，避免借续期改变时长。
+        effective_ttl = old.exp - old.iat if ttl is None else ttl
+
+        quota = self._quota.acquire(old.sub, now=now)
+        if not quota.allowed:
+            return RenewalResult(
+                Decision.DENY_QUOTA_EXCEEDED,
+                f"超出配额: 窗口内已用 {quota.used}/{quota.limit}",
+                claims=old,
+            )
+
+        if not self._revocation.consume(old.jti):
+            reason = self._revocation.invalid_reason(old.jti) or "令牌已失效"
+            return RenewalResult(
+                Decision.DENY_UNAUTHENTICATED,
+                f"凭证无效[{TokenErrorKind.REVOKED.value}]: {reason}",
+                claims=old,
+            )
+
+        new_jti = uuid.uuid4().hex
+        current_key = self._keys.current()
+        new_token = issue_token(
+            sub=old.sub,
+            scopes=sorted(old.scopes),
+            key=current_key,
+            now=now,
+            ttl=effective_ttl,
+            jti=new_jti,
+        )
+        new_claims = Claims(
+            sub=old.sub,
+            scopes=old.scopes,
+            exp=now + effective_ttl,
+            iat=now,
+            jti=new_jti,
+            kid=current_key.kid,
+        )
+        self._revocation.register(old.sub, new_jti)
+        return RenewalResult(Decision.ALLOW, "续期成功", token=new_token, claims=new_claims)
